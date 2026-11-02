@@ -251,7 +251,7 @@ jobs:
             filename="caddy-${CADDY_VERSION}-${variant}-${GOOS}-${GOARCH}"
             [[ "$GOOS" != windows ]] || filename+='.exe'
             GOOS="$GOOS" GOARCH="$GOARCH" CGO_ENABLED=0 \
-              GOARM="${GOARM:-}" xcaddy build "$CADDY_VERSION" --output "dist/$filename" "${args[@]}"
+              GOARM="${GOARM:-}" xcaddy build "v${CADDY_VERSION}" --output "dist/$filename" "${args[@]}"
           done
       - name: Upload binary artifacts
         uses: actions/upload-artifact@v4
