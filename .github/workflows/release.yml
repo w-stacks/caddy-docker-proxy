@@ -1,34 +1,145 @@
 name: release
 
 on:
-  push:
-    tags:
-      - "v*"
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      build_variant:
+        description: Build Caddy with this plugin set
+        type: choice
+        options:
+          - docker-proxy
+          - cloudflare
+          - hetzner
+          - layer4
+          - all
+          - custom
+        default: docker-proxy
+        required: true
+      custom_plugins:
+        description: Comma-separated Go module paths, for example github.com/example/caddy-module@v1.0.0 (used with custom)
+        type: string
+        required: false
+        default: ""
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      caddy_version: ${{ steps.version.outputs.caddy_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check and update Caddy version
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          current="$(sed -n 's/^ARG CADDY_VERSION=//p' Dockerfile | head -n 1)"
+          version="$current"
+          if [[ "$GITHUB_EVENT_NAME" == schedule ]]; then
+            version="$(curl -fsSL -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              https://api.github.com/repos/caddyserver/caddy/releases/latest | jq -er '.tag_name | sub("^v"; "")')"
+            if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+              echo "Unexpected Caddy release version: $version" >&2
+              exit 1
+            fi
+            if [[ "$version" != "$current" ]]; then
+              sed -i "s/^ARG CADDY_VERSION=.*/ARG CADDY_VERSION=$version/" Dockerfile
+              git config user.name github-actions[bot]
+              git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+              git add Dockerfile
+              git commit -m "chore: bump Caddy version to $version"
+              tag="v$version"
+              if ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+                git tag "$tag"
+                git push origin "HEAD:$GITHUB_REF_NAME" "$tag"
+              else
+                git push origin "HEAD:$GITHUB_REF_NAME"
+              fi
+            fi
+          fi
+          echo "caddy_version=$version" >> "$GITHUB_OUTPUT"
+
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      variants: ${{ steps.variants.outputs.variants }}
+    steps:
+      - name: Select build variants
+        id: variants
+        env:
+          BUILD_VARIANT: ${{ inputs.build_variant || 'all' }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch || "$BUILD_VARIANT" == all ]]; then
+            variants='["docker-proxy","cloudflare","hetzner","layer4","all"]'
+          elif [[ "$BUILD_VARIANT" == custom ]]; then
+            variants='["custom"]'
+          else
+            variants="[\"$BUILD_VARIANT\"]"
+          fi
+          echo "variants=$variants" >> "$GITHUB_OUTPUT"
+
   docker:
+    needs: [version, plan]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(needs.plan.outputs.variants) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            ghcr.io/${{ github.repository }}
-          tags: |
-            type=schedule
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha
+      - name: Select plugins and image tags
+        id: build
+        env:
+          VARIANT: ${{ matrix.variant }}
+          CUSTOM_PLUGINS: ${{ inputs.custom_plugins }}
+          CADDY_VERSION: ${{ needs.version.outputs.caddy_version }}
+        run: |
+          set -euo pipefail
+          docker_proxy=github.com/lucaslorentz/caddy-docker-proxy/v2
+          cloudflare=github.com/caddy-dns/cloudflare
+          hetzner=github.com/caddy-dns/hetzner/v2
+          layer4=github.com/mholt/caddy-l4
+          case "$VARIANT" in
+            docker-proxy) plugins="$docker_proxy" ;;
+            cloudflare) plugins="$docker_proxy,$cloudflare" ;;
+            hetzner) plugins="$docker_proxy,$hetzner" ;;
+            layer4) plugins="$docker_proxy,$layer4" ;;
+            all) plugins="$docker_proxy,$cloudflare,$hetzner,$layer4" ;;
+            custom)
+              if [[ ! "$CUSTOM_PLUGINS" =~ ^[A-Za-z0-9._/-]+(@[A-Za-z0-9.+-]+)?(,[A-Za-z0-9._/-]+(@[A-Za-z0-9.+-]+)?)*$ ]]; then
+                echo 'custom_plugins must be a comma-separated list of Go module paths without spaces.' >&2
+                exit 1
+              fi
+              plugins="$docker_proxy,$CUSTOM_PLUGINS"
+              ;;
+          esac
+          if [[ "$VARIANT" == docker-proxy ]]; then
+            tags="$GITHUB_REPOSITORY:latest $GITHUB_REPOSITORY:$CADDY_VERSION $GITHUB_REPOSITORY:docker-proxy $GITHUB_REPOSITORY:$CADDY_VERSION-docker-proxy"
+          elif [[ "$VARIANT" == custom ]]; then
+            tags="$GITHUB_REPOSITORY:custom-$GITHUB_RUN_NUMBER $GITHUB_REPOSITORY:$CADDY_VERSION-custom-$GITHUB_RUN_NUMBER"
+          else
+            tags="$GITHUB_REPOSITORY:$VARIANT $GITHUB_REPOSITORY:$CADDY_VERSION-$VARIANT"
+          fi
+          {
+            echo "plugins=$plugins"
+            echo 'tags<<EOF'
+            for tag in $tags; do echo "ghcr.io/$tag"; done
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
@@ -49,8 +160,124 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+          build-args: |
+            CADDY_VERSION=${{ needs.version.outputs.caddy_version }}
+            CADDY_PLUGINS=${{ steps.build.outputs.plugins }}
+          tags: ${{ steps.build.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  binaries:
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+          - goos: linux
+            goarch: 386
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+          - goos: windows
+            goarch: 386
+          - goos: freebsd
+            goarch: amd64
+          - goos: freebsd
+            goarch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Install xcaddy
+        run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+      - name: Build binaries
+        env:
+          BUILD_VARIANT: ${{ inputs.build_variant || 'all' }}
+          CUSTOM_PLUGINS: ${{ inputs.custom_plugins }}
+          CADDY_VERSION: ${{ needs.version.outputs.caddy_version }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          set -euo pipefail
+          docker_proxy=github.com/lucaslorentz/caddy-docker-proxy/v2
+          cloudflare=github.com/caddy-dns/cloudflare
+          hetzner=github.com/caddy-dns/hetzner/v2
+          layer4=github.com/mholt/caddy-l4
+          if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch || "$BUILD_VARIANT" == all ]]; then
+            variants=(docker-proxy cloudflare hetzner layer4 all)
+          else
+            variants=("$BUILD_VARIANT")
+          fi
+          mkdir -p dist
+          for variant in "${variants[@]}"; do
+            case "$variant" in
+              docker-proxy) plugins="$docker_proxy" ;;
+              cloudflare) plugins="$docker_proxy,$cloudflare" ;;
+              hetzner) plugins="$docker_proxy,$hetzner" ;;
+              layer4) plugins="$docker_proxy,$layer4" ;;
+              all) plugins="$docker_proxy,$cloudflare,$hetzner,$layer4" ;;
+              custom)
+                if [[ ! "$CUSTOM_PLUGINS" =~ ^[A-Za-z0-9._/-]+(@[A-Za-z0-9.+-]+)?(,[A-Za-z0-9._/-]+(@[A-Za-z0-9.+-]+)?)*$ ]]; then
+                  echo 'custom_plugins must be a comma-separated list of Go module paths without spaces.' >&2
+                  exit 1
+                fi
+                plugins="$docker_proxy,$CUSTOM_PLUGINS"
+                ;;
+            esac
+            args=()
+            if [[ -n "$plugins" ]]; then
+              IFS=',' read -ra modules <<< "$plugins"
+              for module in "${modules[@]}"; do args+=(--with "$module"); done
+            fi
+            filename="caddy-${CADDY_VERSION}-${variant}-${GOOS}-${GOARCH}"
+            [[ "$GOOS" != windows ]] || filename+='.exe'
+            GOOS="$GOOS" GOARCH="$GOARCH" CGO_ENABLED=0 \
+              GOARM="${GOARM:-}" xcaddy build "$CADDY_VERSION" --output "dist/$filename" "${args[@]}"
+          done
+      - name: Upload binary artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm && format('-arm{0}', matrix.goarm) || '' }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: [version, docker, binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: binaries-*
+          merge-multiple: true
+      - name: Publish binaries to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.version.outputs.caddy_version }}
+          name: Caddy ${{ needs.version.outputs.caddy_version }}
+          files: release-assets/*
+          overwrite_files: true
+          make_latest: true
