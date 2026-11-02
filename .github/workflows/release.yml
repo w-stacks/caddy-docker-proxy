@@ -79,7 +79,7 @@ jobs:
           BUILD_VARIANT: ${{ inputs.build_variant || 'all' }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch || "$BUILD_VARIANT" == all ]]; then
+          if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch ]]; then
             variants='["docker-proxy","cloudflare","hetzner","layer4","all"]'
           elif [[ "$BUILD_VARIANT" == custom ]]; then
             variants='["custom"]'
@@ -222,7 +222,7 @@ jobs:
           cloudflare=github.com/caddy-dns/cloudflare
           hetzner=github.com/caddy-dns/hetzner/v2
           layer4=github.com/mholt/caddy-l4
-          if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch || "$BUILD_VARIANT" == all ]]; then
+          if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch ]]; then
             variants=(docker-proxy cloudflare hetzner layer4 all)
           else
             variants=("$BUILD_VARIANT")
