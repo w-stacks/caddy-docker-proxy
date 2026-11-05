@@ -1,4 +1,4 @@
-ARG CADDY_VERSION=2.11.8
+ARG CADDY_VERSION=2.11.9
 FROM caddy:${CADDY_VERSION}-builder AS builder
 ARG CADDY_PLUGINS=github.com/lucaslorentz/caddy-docker-proxy/v2
 
